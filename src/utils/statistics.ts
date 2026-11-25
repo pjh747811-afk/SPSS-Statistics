@@ -1,0 +1,2196 @@
+import {
+  AnalysisAccuracyCheck,
+  AnalysisBundle,
+  AnalysisExecutionMeta,
+  AnalysisOptions,
+  ColumnKind,
+  ColumnProfile,
+  CompositeMethod,
+  CompositeSummary,
+  ConstructMapping,
+  CorrelationCell,
+  CorrelationResult,
+  DataRow,
+  EFAConfig,
+  EFALoadingRow,
+  EFAResult,
+  EFAVarianceRow,
+  HypothesisConfig,
+  HypothesisVerificationRow,
+  ItemTotalStat,
+  MediationAnalysisResult,
+  MediationPathResult,
+  MissingValuePolicy,
+  ModerationResult,
+  RegressionCoeff,
+  RegressionResidualSummary,
+  RegressionResult,
+  ReliabilityRow,
+  SimpleSlopePoint,
+  StepIssue,
+} from '../types/stats';
+import { buildDefaultPaths, getDefaultScaleBounds, parsePathSources } from './researchModel';
+
+// ---------- Basic Numeric Helpers & Column Profiling ----------
+
+const MISSING_MARKERS = new Set([
+  '',
+  '.',
+  '-',
+  'na',
+  'n/a',
+  'nan',
+  'null',
+  'none',
+  '#n/a',
+  '#value!',
+  '#ref!',
+  '#div/0!',
+  '결측',
+  '미응답',
+  '무응답',
+]);
+
+export function toNum(val: unknown): number | null {
+  if (val === null || val === undefined || typeof val === 'boolean') return null;
+  if (typeof val === 'number') return Number.isFinite(val) ? val : null;
+  if (val instanceof Date) return null;
+
+  const cleaned = String(val)
+    .replace(/[\u00A0\u3000]/g, ' ')
+    .trim();
+  if (!cleaned) return null;
+  if (MISSING_MARKERS.has(cleaned.toLowerCase())) return null;
+
+  // Match plain numbers, comma-grouped numbers ("1,234.5"), or Likert suffix ("5점")
+  if (/^[+-]?\s*(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:\s*점)?$/.test(cleaned)) {
+    const normalized = cleaned.replace(/,/g, '').replace(/\s*점$/, '').replace(/\s+/g, '');
+    const parsed = Number(normalized);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  // Scientific notation like 1.2e-3
+  if (/^[+-]?\d+(?:\.\d+)?[eE][+-]?\d+$/.test(cleaned)) {
+    const parsed = Number(cleaned);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+}
+
+export function applyReverseCoding(val: number | null, min: number, max: number): number | null {
+  if (val === null || !Number.isFinite(val)) return null;
+  return min + max - val;
+}
+
+interface ItemScaleInfo {
+  reverse: boolean;
+  min: number;
+  max: number;
+}
+
+function buildItemScaleLookup(constructs?: ConstructMapping[]): Map<string, ItemScaleInfo> {
+  const map = new Map<string, ItemScaleInfo>();
+  if (!constructs) return map;
+  for (const c of constructs) {
+    const revSet = new Set(c.reverseItems ?? []);
+    const { min, max } = getDefaultScaleBounds(c.scaleType, c.scaleMin, c.scaleMax);
+    for (const item of c.items) {
+      if (revSet.has(item)) {
+        map.set(item, { reverse: true, min, max });
+      }
+    }
+  }
+  return map;
+}
+
+function getScoredItemValue(
+  row: DataRow,
+  item: string,
+  scaleInfo?: ItemScaleInfo
+): number | null {
+  const raw = toNum(row[item]);
+  if (raw === null) return null;
+  if (scaleInfo?.reverse) {
+    return scaleInfo.min + scaleInfo.max - raw;
+  }
+  return raw;
+}
+
+export function profileColumns(rows: DataRow[], columns: string[]): ColumnProfile[] {
+  return columns.map((name) => {
+    let validCount = 0;
+    let missingCount = 0;
+    let numericCount = 0;
+    let minVal = Infinity;
+    let maxVal = -Infinity;
+    const uniqueSet = new Set<string>();
+
+    for (let i = 0; i < rows.length; i++) {
+      const raw = rows[i]?.[name];
+      const str = raw === null || raw === undefined ? '' : String(raw).replace(/[\u00A0\u3000]/g, ' ').trim();
+      if (!str || MISSING_MARKERS.has(str.toLowerCase())) {
+        missingCount++;
+        continue;
+      }
+      validCount++;
+      uniqueSet.add(str);
+
+      const num = toNum(raw);
+      if (num !== null) {
+        numericCount++;
+        if (num < minVal) minVal = num;
+        if (num > maxVal) maxVal = num;
+      }
+    }
+
+    const uniqueCount = uniqueSet.size;
+    let kind: ColumnKind = 'text';
+    if (validCount === 0) {
+      kind = 'empty';
+    } else if (uniqueCount <= 1) {
+      kind = 'constant';
+    } else if (numericCount / validCount >= 0.7) {
+      kind = 'numeric';
+    } else if (uniqueCount <= 20) {
+      kind = 'categorical';
+    } else {
+      kind = 'text';
+    }
+
+    return {
+      name,
+      kind,
+      validCount,
+      missingCount,
+      uniqueCount,
+      numericCount,
+      min: Number.isFinite(minVal) ? minVal : undefined,
+      max: Number.isFinite(maxVal) ? maxVal : undefined,
+    };
+  });
+}
+
+export function extractNumericColumn(rows: DataRow[], colName: string): (number | null)[] {
+  const raw = rows.map((r) => r[colName]);
+  const numericVals = raw.map((v) => toNum(v));
+  const validNumericCount = numericVals.filter((v) => v !== null).length;
+  const nonEmptyCount = raw.filter((v) => v !== null && v !== undefined && String(v).trim() !== '').length;
+
+  // If mostly numeric, return numeric conversion
+  if (nonEmptyCount === 0 || validNumericCount / nonEmptyCount >= 0.5) {
+    return numericVals;
+  }
+
+  // Deterministic categorical encoding (0, 1, 2...) for text demographic columns used as controls
+  const categories = Array.from(
+    new Set(
+      raw
+        .filter((v) => v !== null && v !== undefined && String(v).trim() !== '')
+        .map((v) => String(v).trim())
+    )
+  ).sort((a, b) => a.localeCompare(b, 'ko'));
+
+  const map = new Map(categories.map((cat, idx) => [cat, idx]));
+  return raw.map((v) => {
+    if (v === null || v === undefined || String(v).trim() === '') return null;
+    return map.get(String(v).trim()) ?? null;
+  });
+}
+
+export function mean(arr: number[]): number {
+  if (!arr.length) return NaN;
+  return arr.reduce((s, v) => s + v, 0) / arr.length;
+}
+
+export function variance(arr: number[], ddof = 1): number {
+  if (arr.length <= ddof) return NaN;
+  const m = mean(arr);
+  let ss = 0;
+  for (let i = 0; i < arr.length; i++) {
+    const d = arr[i] - m;
+    ss += d * d;
+  }
+  return ss / (arr.length - ddof);
+}
+
+export function std(arr: number[], ddof = 1): number {
+  const v = variance(arr, ddof);
+  return Number.isFinite(v) ? Math.sqrt(Math.max(0, v)) : NaN;
+}
+
+export function skewness(arr: number[]): number {
+  const n = arr.length;
+  if (n < 3) return NaN;
+  const m = mean(arr);
+  const s = std(arr, 1);
+  if (!s) return 0;
+  let sum3 = 0;
+  for (let i = 0; i < n; i++) sum3 += ((arr[i] - m) / s) ** 3;
+  return (n / ((n - 1) * (n - 2))) * sum3;
+}
+
+export function kurtosis(arr: number[]): number {
+  const n = arr.length;
+  if (n < 4) return NaN;
+  const m = mean(arr);
+  const s = std(arr, 1);
+  if (!s) return 0;
+  let sum4 = 0;
+  for (let i = 0; i < n; i++) sum4 += ((arr[i] - m) / s) ** 4;
+  return ((n * (n + 1)) / ((n - 1) * (n - 2) * (n - 3))) * sum4 - (3 * (n - 1) ** 2) / ((n - 2) * (n - 3));
+}
+
+// ---------- Special Functions & Probability Distributions ----------
+
+function logGamma(z: number): number {
+  if (z < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * z)) - logGamma(1 - z);
+  z -= 1;
+  const c = [
+    0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+    771.32342877765313, -176.61502916214059, 12.507343278686905,
+    -0.13857109526572012, 9.984369654078761e-6, 1.5056327351493116e-7,
+  ];
+  let x = c[0];
+  for (let i = 1; i < 9; i++) x += c[i] / (z + i);
+  const t = z + 7.5;
+  return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(x);
+}
+
+function betacf(a: number, b: number, x: number): number {
+  const MAXIT = 250;
+  const EPS = 3e-12;
+  const FPMIN = 1e-30;
+  const qab = a + b;
+  const qap = a + 1;
+  const qam = a - 1;
+  let c = 1;
+  let d = 1 - (qab * x) / qap;
+  if (Math.abs(d) < FPMIN) d = FPMIN;
+  d = 1 / d;
+  let h = d;
+  for (let m = 1; m <= MAXIT; m++) {
+    const m2 = 2 * m;
+    let aa = (m * (b - m) * x) / ((qam + m2) * (a + m2));
+    d = 1 + aa * d;
+    if (Math.abs(d) < FPMIN) d = FPMIN;
+    c = 1 + aa / c;
+    if (Math.abs(c) < FPMIN) c = FPMIN;
+    d = 1 / d;
+    h *= d * c;
+    aa = (-(a + m) * (qab + m) * x) / ((a + m2) * (qap + m2));
+    d = 1 + aa * d;
+    if (Math.abs(d) < FPMIN) d = FPMIN;
+    c = 1 + aa / c;
+    if (Math.abs(c) < FPMIN) c = FPMIN;
+    d = 1 / d;
+    const del = d * c;
+    h *= del;
+    if (Math.abs(del - 1) < EPS) break;
+  }
+  return h;
+}
+
+function incompleteBeta(x: number, a: number, b: number): number {
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
+  const bt = Math.exp(
+    logGamma(a + b) - logGamma(a) - logGamma(b) + a * Math.log(x) + b * Math.log(1 - x)
+  );
+  if (x < (a + 1) / (a + b + 2)) {
+    return Math.min(1, Math.max(0, (bt * betacf(a, b, x)) / a));
+  }
+  return Math.min(1, Math.max(0, 1 - (bt * betacf(b, a, 1 - x)) / b));
+}
+
+export function tDistP(t: number, df: number): number {
+  if (!Number.isFinite(t) || df < 1) return 1;
+  if (t === 0) return 1;
+  const x = df / (df + t * t);
+  const bt = incompleteBeta(x, df / 2, 0.5);
+  return Math.min(1, Math.max(0, bt));
+}
+
+export function fDistP(f: number, df1: number, df2: number): number {
+  if (!Number.isFinite(f) || f <= 0 || df1 < 1 || df2 < 1) return 1;
+  const x = df2 / (df2 + df1 * f);
+  return Math.min(1, Math.max(0, incompleteBeta(x, df2 / 2, df1 / 2)));
+}
+
+// Regularized upper incomplete gamma Q(a, x) for chi-square p-value
+function gammaQ(a: number, x: number): number {
+  if (x <= 0) return 1;
+  if (a <= 0) return 0;
+  const gln = logGamma(a);
+  if (x < a + 1) {
+    let ap = a;
+    let sum = 1 / a;
+    let del = sum;
+    for (let n = 1; n <= 300; n++) {
+      ap += 1;
+      del *= x / ap;
+      sum += del;
+      if (Math.abs(del) < Math.abs(sum) * 1e-12) break;
+    }
+    const p = sum * Math.exp(-x + a * Math.log(x) - gln);
+    return Math.min(1, Math.max(0, 1 - p));
+  } else {
+    let b = x + 1 - a;
+    let c = 1 / 1e-30;
+    let d = 1 / b;
+    let h = d;
+    for (let i = 1; i <= 300; i++) {
+      const an = -i * (i - a);
+      b += 2;
+      d = an * d + b;
+      if (Math.abs(d) < 1e-30) d = 1e-30;
+      c = b + an / c;
+      if (Math.abs(c) < 1e-30) c = 1e-30;
+      d = 1 / d;
+      const del = d * c;
+      h *= del;
+      if (Math.abs(del - 1) < 1e-12) break;
+    }
+    return Math.min(1, Math.max(0, Math.exp(-x + a * Math.log(x) - gln) * h));
+  }
+}
+
+export function chiSquareP(chi2: number, df: number): number {
+  if (!Number.isFinite(chi2) || chi2 <= 0 || df < 1) return 1;
+  return gammaQ(df / 2, chi2 / 2);
+}
+
+// Standard normal two-tailed p-value
+export function normalP(z: number): number {
+  if (!Number.isFinite(z)) return 1;
+  const az = Math.abs(z);
+  const t = 1 / (1 + 0.2316419 * az);
+  const d = 0.3989422804014327 * Math.exp((-az * az) / 2);
+  const p =
+    d *
+    t *
+    (0.31938153 +
+      t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+  return Math.min(1, Math.max(0, 2 * p));
+}
+
+// ---------- Matrix Operations ----------
+
+function invertMatrix(M: number[][]): { inv: number[][]; det: number } | null {
+  const k = M.length;
+  const A = M.map((r, i) => [...r, ...Array.from({ length: k }, (_, j) => (i === j ? 1 : 0))]);
+  let det = 1;
+  for (let col = 0; col < k; col++) {
+    let piv = col;
+    for (let r = col + 1; r < k; r++) {
+      if (Math.abs(A[r][col]) > Math.abs(A[piv][col])) piv = r;
+    }
+    if (piv !== col) {
+      [A[col], A[piv]] = [A[piv], A[col]];
+      det *= -1;
+    }
+    const div = A[col][col];
+    if (Math.abs(div) < 1e-12) return null;
+    det *= div;
+    for (let j = 0; j < 2 * k; j++) A[col][j] /= div;
+    for (let r = 0; r < k; r++) {
+      if (r === col) continue;
+      const f = A[r][col];
+      for (let j = 0; j < 2 * k; j++) A[r][j] -= f * A[col][j];
+    }
+  }
+  return { inv: A.map((r) => r.slice(k)), det };
+}
+
+function jacobiEigen(A_in: number[][]): { eigenvalues: number[]; eigenvectors: number[][] } {
+  const n = A_in.length;
+  const A = A_in.map((r) => [...r]);
+  const V: number[][] = Array.from({ length: n }, (_, i) =>
+    Array.from({ length: n }, (__, j) => (i === j ? 1 : 0))
+  );
+
+  const maxIter = 100 * n * n;
+  for (let iter = 0; iter < maxIter; iter++) {
+    let p = 0;
+    let q = 1;
+    let maxVal = 0;
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const v = Math.abs(A[i][j]);
+        if (v > maxVal) {
+          maxVal = v;
+          p = i;
+          q = j;
+        }
+      }
+    }
+    if (maxVal < 1e-12) break;
+
+    const app = A[p][p];
+    const aqq = A[q][q];
+    const apq = A[p][q];
+    const tau = (aqq - app) / (2 * apq);
+    const t = tau >= 0 ? 1 / (tau + Math.sqrt(1 + tau * tau)) : -1 / (-tau + Math.sqrt(1 + tau * tau));
+    const c = 1 / Math.sqrt(1 + t * t);
+    const s = t * c;
+
+    A[p][p] = app - t * apq;
+    A[q][q] = aqq + t * apq;
+    A[p][q] = 0;
+    A[q][p] = 0;
+
+    for (let r = 0; r < n; r++) {
+      if (r !== p && r !== q) {
+        const arp = A[r][p];
+        const arq = A[r][q];
+        A[r][p] = c * arp - s * arq;
+        A[p][r] = A[r][p];
+        A[r][q] = s * arp + c * arq;
+        A[q][r] = A[r][q];
+      }
+    }
+
+    for (let r = 0; r < n; r++) {
+      const vrp = V[r][p];
+      const vrq = V[r][q];
+      V[r][p] = c * vrp - s * vrq;
+      V[r][q] = s * vrp + c * vrq;
+    }
+  }
+
+  const pairs = Array.from({ length: n }, (_, i) => ({
+    val: A[i][i],
+    vec: V.map((row) => row[i]),
+  })).sort((a, b) => b.val - a.val);
+
+  return {
+    eigenvalues: pairs.map((p) => p.val),
+    eigenvectors: pairs.map((p) => p.vec),
+  };
+}
+
+// ---------- 1. Exploratory Factor Analysis (PCA + Varimax) ----------
+
+export function runEFAWithDiagnostics(
+  rows: DataRow[],
+  config: EFAConfig,
+  options?: { constructs?: ConstructMapping[]; missingPolicy?: MissingValuePolicy }
+): { result: EFAResult | null; issues: StepIssue[] } {
+  const issues: StepIssue[] = [];
+  const rawItems = Array.from(new Set(config.items));
+  const scaleLookup = buildItemScaleLookup(options?.constructs);
+  const requestedPolicy = options?.missingPolicy ?? 'listwise';
+
+  if (rawItems.length < 2) {
+    issues.push({
+      step: 'efa',
+      severity: 'error',
+      constraint: '최소 문항 수 (≥ 2개) 미달',
+      message: '요인분석을 실행하려면 최소 2개 이상의 측정 문항이 매핑되어야 합니다.',
+      actionHint: '0단계 [변수 매핑 · 모형 설정] 탭에서 수치형 설문 문항을 2개 이상 선택해 주세요.',
+      variables: rawItems,
+    });
+    return { result: null, issues };
+  }
+
+  if (rows.length < 3) {
+    issues.push({
+      step: 'efa',
+      severity: 'error',
+      constraint: '최소 표본 수 (N ≥ 3) 미달',
+      message: `표본 수(N=${rows.length})가 너무 적어 요인분석을 실행할 수 없습니다 (최소 3케이스 필요).`,
+      actionHint: '3행 이상의 응답 데이터가 포함된 파일을 업로드해 주세요.',
+      variables: rawItems,
+    });
+    return { result: null, issues };
+  }
+
+  // Pre-screen each selected item for numeric validity & variance
+  const validItems: string[] = [];
+  const excludedItems: { item: string; reason: string }[] = [];
+
+  for (const item of rawItems) {
+    const scaleInfo = scaleLookup.get(item);
+    const vals: number[] = [];
+    for (let r = 0; r < rows.length; r++) {
+      const v = getScoredItemValue(rows[r], item, scaleInfo);
+      if (v !== null) vals.push(v);
+    }
+    if (vals.length < 3) {
+      excludedItems.push({ item, reason: `유효 수치 부족(N=${vals.length})` });
+    } else {
+      const s = std(vals, 1);
+      if (!Number.isFinite(s) || s <= 1e-12) {
+        excludedItems.push({ item, reason: '모든 응답값 동일(분산 0)' });
+      } else {
+        validItems.push(item);
+      }
+    }
+  }
+
+  if (excludedItems.length > 0) {
+    issues.push({
+      step: 'efa',
+      severity: 'warning',
+      constraint: '비수치 / 분산 0 문항 자동 제외',
+      message: `수치형이 아니거나 분산이 0인 문항 ${excludedItems.length}개를 요인분석에서 자동 제외했습니다: ${excludedItems
+        .map((e) => `${e.item}(${e.reason})`)
+        .join(', ')}`,
+      actionHint: '문자형/날짜/고정값 열이 문항에 포함되었다면 [변수 매핑 · 모형 설정]에서 제외해 주세요.',
+      variables: excludedItems.map((e) => e.item),
+    });
+  }
+
+  const p = validItems.length;
+  if (p < 2) {
+    issues.push({
+      step: 'efa',
+      severity: 'error',
+      constraint: '최소 문항 수 (≥ 2개) 미달',
+      message: '유효한 수치형 문항이 2개 미만이어서 요인분석을 진행할 수 없습니다.',
+      actionHint: '숫자 응답(예: 리커트 1~5점)으로 구성된 문항을 2개 이상 지정해 주세요.',
+      variables: rawItems,
+    });
+    return { result: null, issues };
+  }
+
+  // Count listwise complete cases
+  const listwiseMatrix: number[][] = [];
+  for (let r = 0; r < rows.length; r++) {
+    const vals: number[] = [];
+    let ok = true;
+    for (let c = 0; c < p; c++) {
+      const item = validItems[c];
+      const v = getScoredItemValue(rows[r], item, scaleLookup.get(item));
+      if (v === null) {
+        ok = false;
+        break;
+      }
+      vals.push(v);
+    }
+    if (ok) listwiseMatrix.push(vals);
+  }
+
+  const hasMissing = listwiseMatrix.length < rows.length;
+  let n = listwiseMatrix.length;
+  let missingMode: 'listwise' | 'pairwise' | 'mean_impute' = 'listwise';
+  const R = Array.from({ length: p }, () => Array(p).fill(0));
+  let activeItems = validItems;
+
+  if (requestedPolicy === 'mean_impute' && hasMissing) {
+    missingMode = 'mean_impute';
+    const colMeans = validItems.map((item) => {
+      const info = scaleLookup.get(item);
+      const vals: number[] = [];
+      for (let r = 0; r < rows.length; r++) {
+        const v = getScoredItemValue(rows[r], item, info);
+        if (v !== null) vals.push(v);
+      }
+      return mean(vals);
+    });
+    const imputedMatrix: number[][] = [];
+    for (let r = 0; r < rows.length; r++) {
+      const rowVals: number[] = [];
+      let rowValid = true;
+      for (let j = 0; j < p; j++) {
+        const item = validItems[j];
+        const v = getScoredItemValue(rows[r], item, scaleLookup.get(item));
+        const filled = v !== null ? v : colMeans[j];
+        if (!Number.isFinite(filled)) {
+          rowValid = false;
+          break;
+        }
+        rowVals.push(filled);
+      }
+      if (rowValid) imputedMatrix.push(rowVals);
+    }
+    n = imputedMatrix.length;
+    if (n < 3) {
+      issues.push({
+        step: 'efa',
+        severity: 'error',
+        constraint: '유효 표본 수(N) 부족',
+        message: '평균 대체 후에도 요인분석에 필요한 최소 표본 수(N≥3)를 충족하지 못했습니다.',
+        variables: validItems,
+      });
+      return { result: null, issues };
+    }
+    for (let i = 0; i < p; i++) {
+      R[i][i] = 1;
+      const colI = imputedMatrix.map((row) => row[i]);
+      for (let j = i + 1; j < p; j++) {
+        const colJ = imputedMatrix.map((row) => row[j]);
+        const { r: corr } = pearsonPair(colI, colJ);
+        R[i][j] = Number.isFinite(corr) ? corr : 0;
+        R[j][i] = R[i][j];
+      }
+    }
+  } else if (
+    requestedPolicy !== 'pairwise' &&
+    listwiseMatrix.length >= Math.max(3, p + 1)
+  ) {
+    missingMode = 'listwise';
+    // Check listwise column variance (a column can become constant after listwise filtering)
+    const nonConstIndices: number[] = [];
+    for (let j = 0; j < p; j++) {
+      const col = listwiseMatrix.map((r) => r[j]);
+      const s = std(col, 1);
+      if (!Number.isFinite(s) || s <= 1e-12) {
+        excludedItems.push({ item: validItems[j], reason: '결측 제외 후 분산 0' });
+      } else {
+        nonConstIndices.push(j);
+      }
+    }
+
+    if (nonConstIndices.length < 2) {
+      issues.push({
+        step: 'efa',
+        severity: 'error',
+        constraint: '결측 제외 후 분산 0 (상수 문항)',
+        message: '결측값 제거 후 분산이 0이 아닌 문항이 2개 미만입니다.',
+        actionHint: '결측이 집중된 문항을 제외하거나 결측 처리 방식을 변경해 주세요.',
+        variables: excludedItems.map((e) => e.item),
+      });
+      return { result: null, issues };
+    }
+
+    activeItems = nonConstIndices.map((idx) => validItems[idx]);
+    const filteredMatrix = listwiseMatrix.map((row) => nonConstIndices.map((idx) => row[idx]));
+    const pActive = activeItems.length;
+    const means = Array(pActive).fill(0);
+    const sds = Array(pActive).fill(0);
+    for (let j = 0; j < pActive; j++) {
+      const col = filteredMatrix.map((r) => r[j]);
+      means[j] = mean(col);
+      sds[j] = std(col, 1);
+    }
+
+    for (let i = 0; i < pActive; i++) {
+      R[i][i] = 1;
+      for (let j = i + 1; j < pActive; j++) {
+        let s = 0;
+        for (let r = 0; r < n; r++) {
+          s +=
+            ((filteredMatrix[r][i] - means[i]) / sds[i]) *
+            ((filteredMatrix[r][j] - means[j]) / sds[j]);
+        }
+        const corr = Math.max(-1, Math.min(1, s / (n - 1)));
+        R[i][j] = corr;
+        R[j][i] = corr;
+      }
+    }
+  } else {
+    // Pairwise correlation matrix (when selected or when listwise N is insufficient)
+    missingMode = hasMissing ? 'pairwise' : 'listwise';
+    const numericCols = validItems.map((item) => {
+      const info = scaleLookup.get(item);
+      return rows.map((r) => getScoredItemValue(r, item, info));
+    });
+    let minPairN = Infinity;
+    let invalidPairs = 0;
+
+    for (let i = 0; i < p; i++) {
+      R[i][i] = 1;
+      for (let j = i + 1; j < p; j++) {
+        const xi: number[] = [];
+        const xj: number[] = [];
+        for (let r = 0; r < rows.length; r++) {
+          const vi = numericCols[i][r];
+          const vj = numericCols[j][r];
+          if (vi !== null && vj !== null) {
+            xi.push(vi);
+            xj.push(vj);
+          }
+        }
+        const { r: corr, n: pairN } = pearsonPair(xi, xj);
+        if (pairN < minPairN) minPairN = pairN;
+        if (!Number.isFinite(corr)) {
+          invalidPairs++;
+          R[i][j] = 0;
+          R[j][i] = 0;
+        } else {
+          R[i][j] = corr;
+          R[j][i] = corr;
+        }
+      }
+    }
+
+    const rowHasAny = rows.filter((r) =>
+      validItems.some((it) => getScoredItemValue(r, it, scaleLookup.get(it)) !== null)
+    ).length;
+    n = Number.isFinite(minPairN) && minPairN > 0 ? minPairN : rowHasAny;
+
+    if (n < 3 || invalidPairs > (p * (p - 1)) / 4) {
+      issues.push({
+        step: 'efa',
+        severity: 'error',
+        constraint: '유효 표본 수(N) 부족',
+        message: `결측값을 제외한 유효 표본 수(목록별 N=${listwiseMatrix.length}, 쌍별 최소 N=${
+          Number.isFinite(minPairN) ? minPairN : 0
+        })가 문항 수(${p}개) 대비 부족하여 요인분석을 수행할 수 없습니다.`,
+        actionHint: '결측이 많은 문항 또는 빈 행을 정리하거나 더 많은 응답 표본을 업로드해 주세요.',
+        variables: validItems,
+      });
+      return { result: null, issues };
+    }
+
+    if (hasMissing && requestedPolicy === 'listwise') {
+      issues.push({
+        step: 'efa',
+        severity: 'warning',
+        constraint: '목록별 표본 부족 → 쌍별 결측 제외 적용',
+        message: `일부 문항에 결측값이 포함되어 목록별 완전 케이스(N=${listwiseMatrix.length})가 문항 수(${p}개)보다 적으므로, SPSS 쌍별 제외(Pairwise, 최소 N=${n}) 방식으로 상관계수 행렬을 산출했습니다.`,
+        actionHint: '결측이 집중된 문항이 있다면 [변수 매핑 · 모형 설정]에서 해당 문항을 점검하세요.',
+        variables: validItems,
+      });
+    }
+  }
+
+  const pActive = activeItems.length;
+  const activeR =
+    pActive === R.length ? R : R.slice(0, pActive).map((row) => row.slice(0, pActive));
+
+  // KMO & Bartlett's Test
+  const invResult = invertMatrix(activeR);
+  let kmo = NaN;
+  let bartlettChi2 = NaN;
+  const bartlettDf = (pActive * (pActive - 1)) / 2;
+  let bartlettP = NaN;
+
+  if (invResult) {
+    const { inv, det } = invResult;
+    let sumR2 = 0;
+    let sumA2 = 0;
+    for (let i = 0; i < pActive; i++) {
+      for (let j = 0; j < pActive; j++) {
+        if (i === j) continue;
+        sumR2 += activeR[i][j] * activeR[i][j];
+        const denom = Math.sqrt(Math.max(1e-12, inv[i][i] * inv[j][j]));
+        const aij = -inv[i][j] / denom;
+        sumA2 += aij * aij;
+      }
+    }
+    kmo = sumR2 + sumA2 > 0 ? sumR2 / (sumR2 + sumA2) : NaN;
+    if (det > 0) {
+      bartlettChi2 = -(n - 1 - (2 * pActive + 5) / 6) * Math.log(det);
+      bartlettP = chiSquareP(bartlettChi2, bartlettDf);
+    }
+  } else {
+    issues.push({
+      step: 'efa',
+      severity: 'warning',
+      constraint: '상관행렬 특이값 (KMO·Bartlett 생략)',
+      message:
+        '문항 간 상관행렬이 특이행렬(완전 다중공선성 또는 표본 수 < 문항 수)이어서 KMO·Bartlett 검정치는 산출되지 않았으나 주성분 요인부하량은 계산되었습니다.',
+      actionHint: '완전히 동일한 문항을 제거하거나 표본 수를 늘리면 KMO/Bartlett 검정이 정상 산출됩니다.',
+      variables: activeItems,
+    });
+  }
+
+  // Eigen decomposition
+  const { eigenvalues, eigenvectors } = jacobiEigen(activeR);
+  let numFactors =
+    config.extractionMode === 'fixed'
+      ? Math.max(1, Math.min(pActive, config.fixedFactors))
+      : eigenvalues.filter((ev) => ev > 1.0).length;
+  if (numFactors < 1) numFactors = 1;
+
+  // Initial loading matrix L (pActive x m)
+  const L = Array.from({ length: pActive }, (_, i) =>
+    Array.from({ length: numFactors }, (__, j) => {
+      const ev = Math.max(0, eigenvalues[j]);
+      return eigenvectors[j][i] * Math.sqrt(ev);
+    })
+  );
+
+  // Communalities
+  const communalities = L.map((row) => row.reduce((s, v) => s + v * v, 0));
+
+  // Varimax rotation with Kaiser normalization
+  const H = communalities.map((h) => (h > 1e-12 ? Math.sqrt(h) : 1));
+  const Rmat = L.map((row, i) => row.map((v) => v / H[i]));
+
+  if (numFactors > 1) {
+    for (let sweep = 0; sweep < 60; sweep++) {
+      let maxAngle = 0;
+      for (let j = 0; j < numFactors; j++) {
+        for (let k = j + 1; k < numFactors; k++) {
+          let u = 0;
+          let v = 0;
+          let a = 0;
+          let b = 0;
+          for (let i = 0; i < pActive; i++) {
+            const x = Rmat[i][j];
+            const y = Rmat[i][k];
+            const ui = x * x - y * y;
+            const vi = 2 * x * y;
+            u += ui;
+            v += vi;
+            a += ui * ui - vi * vi;
+            b += 2 * ui * vi;
+          }
+          const num = b - (2 * u * v) / pActive;
+          const den = a - (u * u - v * v) / pActive;
+          const angle = 0.25 * Math.atan2(num, den);
+          if (Math.abs(angle) > maxAngle) maxAngle = Math.abs(angle);
+          if (Math.abs(angle) > 1e-10) {
+            const cosA = Math.cos(angle);
+            const sinA = Math.sin(angle);
+            for (let i = 0; i < pActive; i++) {
+              const x = Rmat[i][j];
+              const y = Rmat[i][k];
+              Rmat[i][j] = x * cosA + y * sinA;
+              Rmat[i][k] = -x * sinA + y * cosA;
+            }
+          }
+        }
+      }
+      if (maxAngle < 1e-7) break;
+    }
+  }
+
+  // Denormalize
+  let rotated = Rmat.map((row, i) => row.map((v) => v * H[i]));
+
+  // Flip sign so each factor's largest-magnitude loading is positive, and sort factors by SS descending
+  const factorInfos = Array.from({ length: numFactors }, (_, j) => {
+    let ss = 0;
+    let maxIdx = 0;
+    let maxAbs = 0;
+    for (let i = 0; i < pActive; i++) {
+      ss += rotated[i][j] ** 2;
+      if (Math.abs(rotated[i][j]) > maxAbs) {
+        maxAbs = Math.abs(rotated[i][j]);
+        maxIdx = i;
+      }
+    }
+    const sign = rotated[maxIdx][j] < 0 ? -1 : 1;
+    return { origIdx: j, ss, sign };
+  }).sort((a, b) => b.ss - a.ss);
+
+  rotated = rotated.map((row) => factorInfos.map((fi) => row[fi.origIdx] * fi.sign));
+
+  // Variance Explained Table
+  const totalVar = pActive;
+  let initCum = 0;
+  let rotCum = 0;
+  const varianceExplained: EFAVarianceRow[] = [];
+  for (let i = 0; i < pActive; i++) {
+    const initEv = Math.max(0, eigenvalues[i]);
+    const initPct = (initEv / totalVar) * 100;
+    initCum += initPct;
+
+    let rotSS = 0;
+    let rotPct = 0;
+    if (i < numFactors) {
+      rotSS = factorInfos[i].ss;
+      rotPct = (rotSS / totalVar) * 100;
+      rotCum += rotPct;
+    }
+    varianceExplained.push({
+      component: i + 1,
+      initialEigenvalue: initEv,
+      initialPctVar: initPct,
+      initialCumPct: initCum,
+      rotSS: i < numFactors ? rotSS : 0,
+      rotPctVar: i < numFactors ? rotPct : 0,
+      rotCumPct: i < numFactors ? rotCum : 0,
+    });
+  }
+
+  // Build Rotated Component Matrix Rows with cross-loading detection
+  let rotatedMatrix: EFALoadingRow[] = activeItems.map((item, i) => {
+    const loadings = rotated[i];
+    let dominantFactor = 0;
+    let maxAbsLoading = 0;
+    let secondLoading = 0;
+    for (let j = 0; j < numFactors; j++) {
+      const a = Math.abs(loadings[j]);
+      if (a > maxAbsLoading) {
+        secondLoading = maxAbsLoading;
+        maxAbsLoading = a;
+        dominantFactor = j;
+      } else if (a > secondLoading) {
+        secondLoading = a;
+      }
+    }
+    const crossLoaded =
+      numFactors > 1 && secondLoading >= 0.4 && maxAbsLoading - secondLoading <= 0.2;
+    return {
+      item,
+      communality: communalities[i],
+      loadings,
+      dominantFactor,
+      maxAbsLoading,
+      crossLoaded,
+      secondLoading,
+    };
+  });
+
+  const crossLoadedItems = rotatedMatrix.filter((r) => r.crossLoaded).map((r) => r.item);
+  if (crossLoadedItems.length > 0) {
+    issues.push({
+      step: 'efa',
+      severity: 'warning',
+      constraint: '교차 적재(Cross-loading) 문항 감지',
+      message: `2개 이상 요인에 유사한 수준으로 적재된 교차 적재 문항(${crossLoadedItems.join(', ')})이 감지되었습니다. 타당성 확보를 위해 문항 제거 여부를 검토하세요.`,
+      variables: crossLoadedItems,
+    });
+  }
+
+  if (config.sortBySize) {
+    rotatedMatrix = rotatedMatrix.sort((a, b) => {
+      if (a.dominantFactor !== b.dominantFactor) return a.dominantFactor - b.dominantFactor;
+      return b.maxAbsLoading - a.maxAbsLoading;
+    });
+  }
+
+  // Component Score Coefficient Matrix: B = R^{-1} * L_rot
+  const scoreCoeffMatrix: { item: string; coeffs: number[] }[] = [];
+  if (invResult) {
+    const { inv } = invResult;
+    for (let i = 0; i < pActive; i++) {
+      const coeffs: number[] = [];
+      for (let f = 0; f < numFactors; f++) {
+        let sum = 0;
+        for (let k = 0; k < pActive; k++) {
+          sum += inv[i][k] * rotated[k][f];
+        }
+        coeffs.push(sum);
+      }
+      scoreCoeffMatrix.push({ item: activeItems[i], coeffs });
+    }
+  }
+
+  const harmanSingleFactorPct = varianceExplained[0]?.initialPctVar ?? NaN;
+
+  return {
+    result: {
+      n,
+      p: pActive,
+      numFactors,
+      kmo,
+      bartlettChi2,
+      bartlettDf,
+      bartlettP,
+      harmanSingleFactorPct,
+      eigenvalues,
+      varianceExplained,
+      rotatedMatrix,
+      scoreCoeffMatrix,
+      itemNames: activeItems,
+      missingMode,
+      excludedItems: excludedItems.length ? excludedItems : undefined,
+    },
+    issues,
+  };
+}
+
+export function runEFA(rows: DataRow[], config: EFAConfig): EFAResult | null {
+  return runEFAWithDiagnostics(rows, config).result;
+}
+
+// ---------- 2. Reliability Analysis (Cronbach's Alpha) ----------
+
+export function computeCronbachAlpha(matrix: number[][]): number {
+  const n = matrix.length;
+  const k = matrix[0]?.length || 0;
+  if (n < 2 || k < 2) return NaN;
+
+  const itemVars: number[] = [];
+  for (let j = 0; j < k; j++) {
+    itemVars.push(variance(matrix.map((r) => r[j]), 1));
+  }
+  const totals = matrix.map((r) => r.reduce((s, v) => s + v, 0));
+  const totalVar = variance(totals, 1);
+  if (!totalVar || totalVar === 0) return NaN;
+  return (k / (k - 1)) * (1 - itemVars.reduce((s, v) => s + v, 0) / totalVar);
+}
+
+export function pearsonPair(x: number[], y: number[]): { r: number; p: number; n: number } {
+  let sx = 0;
+  let sy = 0;
+  let sxx = 0;
+  let syy = 0;
+  let sxy = 0;
+  let c = 0;
+  const len = Math.min(x.length, y.length);
+  for (let i = 0; i < len; i++) {
+    const a = x[i];
+    const b = y[i];
+    if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+    sx += a;
+    sy += b;
+    sxx += a * a;
+    syy += b * b;
+    sxy += a * b;
+    c++;
+  }
+  if (c < 3) return { r: NaN, p: NaN, n: c };
+  const num = c * sxy - sx * sy;
+  const den = Math.sqrt(Math.max(0, (c * sxx - sx * sx) * (c * syy - sy * sy)));
+  if (den === 0) return { r: NaN, p: NaN, n: c };
+  const r = Math.max(-1, Math.min(1, num / den));
+  const p = Math.abs(r) >= 1 - 1e-12 ? 0 : tDistP(Math.abs(r) * Math.sqrt((c - 2) / (1 - r * r)), c - 2);
+  return { r, p, n: c };
+}
+
+export function runReliability(
+  rows: DataRow[],
+  constructs: ConstructMapping[],
+  options?: { missingPolicy?: MissingValuePolicy }
+): ReliabilityRow[] {
+  const results: ReliabilityRow[] = [];
+  const missingPolicy = options?.missingPolicy ?? 'pairwise';
+
+  for (const c of constructs) {
+    const k = c.items.length;
+    if (k === 0) continue;
+
+    const revSet = new Set(c.reverseItems ?? []);
+    const { min, max } = getDefaultScaleBounds(c.scaleType, c.scaleMin, c.scaleMax);
+    const scoreItem = (r: DataRow, item: string): number | null => {
+      const v = toNum(r[item]);
+      if (v === null) return null;
+      return revSet.has(item) ? min + max - v : v;
+    };
+
+    const itemMeans =
+      missingPolicy === 'mean_impute'
+        ? c.items.map((it) => {
+            const vals = rows.map((r) => scoreItem(r, it)).filter((v): v is number => v !== null);
+            return mean(vals);
+          })
+        : [];
+
+    const matrix: number[][] = [];
+    for (let i = 0; i < rows.length; i++) {
+      const vals: number[] = [];
+      let ok = true;
+      for (let j = 0; j < k; j++) {
+        let v = scoreItem(rows[i], c.items[j]);
+        if (v === null && missingPolicy === 'mean_impute' && Number.isFinite(itemMeans[j])) {
+          v = itemMeans[j];
+        }
+        if (v === null) {
+          ok = false;
+          break;
+        }
+        vals.push(v);
+      }
+      if (ok) matrix.push(vals);
+    }
+
+    const nValid = matrix.length;
+    const alpha = computeCronbachAlpha(matrix);
+
+    // Standardized Alpha
+    let sumCorr = 0;
+    let pairs = 0;
+    for (let i = 0; i < k; i++) {
+      for (let j = i + 1; j < k; j++) {
+        const colI = matrix.map((r) => r[i]);
+        const colJ = matrix.map((r) => r[j]);
+        const { r } = pearsonPair(colI, colJ);
+        if (Number.isFinite(r)) {
+          sumCorr += r;
+          pairs++;
+        }
+      }
+    }
+    const meanCorr = pairs > 0 ? sumCorr / pairs : NaN;
+    const standardizedAlpha =
+      k >= 2 && Number.isFinite(meanCorr) ? (k * meanCorr) / (1 + (k - 1) * meanCorr) : NaN;
+
+    // Item-Total Statistics
+    const itemStats: ItemTotalStat[] = [];
+    const totals = matrix.map((r) => r.reduce((s, v) => s + v, 0));
+    for (let j = 0; j < k; j++) {
+      const itemCol = matrix.map((r) => r[j]);
+      const restTotals = matrix.map((r, idx) => totals[idx] - r[j]);
+      const subMatrix = matrix.map((r) => r.filter((_, idx) => idx !== j));
+      const { r: citc } = pearsonPair(itemCol, restTotals);
+      itemStats.push({
+        item: c.items[j],
+        scaleMeanIfDeleted: mean(restTotals),
+        scaleVarIfDeleted: variance(restTotals, 1),
+        correctedItemTotalCorr: citc,
+        alphaIfDeleted: k > 2 ? computeCronbachAlpha(subMatrix) : NaN,
+      });
+    }
+
+    results.push({
+      constructName: c.name,
+      items: c.items,
+      reverseItems: c.reverseItems?.length ? [...c.reverseItems] : undefined,
+      nValid,
+      nItems: k,
+      alpha,
+      standardizedAlpha,
+      itemStats,
+    });
+  }
+
+  return results;
+}
+
+// ---------- 3. Composite Variables (Mean / Sum with Reverse Coding) ----------
+
+export function computeComposites(
+  rows: DataRow[],
+  constructs: ConstructMapping[],
+  options?: { missingPolicy?: MissingValuePolicy; compositeMethod?: CompositeMethod }
+): CompositeSummary[] {
+  const missingPolicy = options?.missingPolicy ?? 'pairwise';
+  const method = options?.compositeMethod ?? 'mean';
+
+  return constructs
+    .filter((c) => c.items.length > 0)
+    .map((c) => {
+      const revSet = new Set(c.reverseItems ?? []);
+      const { min, max } = getDefaultScaleBounds(c.scaleType, c.scaleMin, c.scaleMax);
+      const scoreItem = (r: DataRow, item: string): number | null => {
+        const v = toNum(r[item]);
+        if (v === null) return null;
+        return revSet.has(item) ? min + max - v : v;
+      };
+
+      const itemMeans =
+        missingPolicy === 'mean_impute'
+          ? c.items.map((it) => {
+              const vals = rows.map((r) => scoreItem(r, it)).filter((v): v is number => v !== null);
+              return mean(vals);
+            })
+          : [];
+
+      const values: (number | null)[] = rows.map((r) => {
+        const validVals: number[] = [];
+        let hasMissingInRow = false;
+        for (let j = 0; j < c.items.length; j++) {
+          let v = scoreItem(r, c.items[j]);
+          if (v === null) {
+            if (missingPolicy === 'mean_impute' && Number.isFinite(itemMeans[j])) {
+              v = itemMeans[j];
+            } else {
+              hasMissingInRow = true;
+            }
+          }
+          if (v !== null) validVals.push(v);
+        }
+        if (missingPolicy === 'listwise' && hasMissingInRow) return null;
+        if (!validVals.length) return null;
+        const total = validVals.reduce((s, v) => s + v, 0);
+        return method === 'sum' ? total : total / validVals.length;
+      });
+
+      const valid = values.filter((v): v is number => v !== null);
+      const itemTerms = c.items.map((it) => (revSet.has(it) ? `(${min + max} - ${it})` : it));
+      const formula =
+        itemTerms.length === 1
+          ? itemTerms[0]
+          : method === 'sum'
+            ? itemTerms.join(' + ')
+            : `(${itemTerms.join(' + ')}) / ${c.items.length}`;
+
+      return {
+        name: c.name,
+        items: c.items,
+        reverseItems: c.reverseItems?.length ? [...c.reverseItems] : undefined,
+        formula,
+        method,
+        n: valid.length,
+        mean: mean(valid),
+        sd: std(valid, 1),
+        min: valid.length ? Math.min(...valid) : NaN,
+        max: valid.length ? Math.max(...valid) : NaN,
+        skewness: skewness(valid),
+        kurtosis: kurtosis(valid),
+        values,
+      };
+    });
+}
+
+// ---------- 4. Pearson Correlation Matrix ----------
+
+export function runCorrelation(composites: CompositeSummary[]): CorrelationResult {
+  const names = composites.map((c) => c.name);
+  const k = names.length;
+  const matrix: CorrelationCell[][] = Array.from({ length: k }, () =>
+    Array.from({ length: k }, () => ({ r: NaN, p: NaN, n: 0 }))
+  );
+
+  for (let i = 0; i < k; i++) {
+    const validI = composites[i].values.filter((v): v is number => v !== null);
+    matrix[i][i] = { r: 1, p: 0, n: validI.length };
+    for (let j = i + 1; j < k; j++) {
+      const xi: number[] = [];
+      const xj: number[] = [];
+      for (let r = 0; r < composites[i].values.length; r++) {
+        const vi = composites[i].values[r];
+        const vj = composites[j].values[r];
+        if (vi !== null && vj !== null) {
+          xi.push(vi);
+          xj.push(vj);
+        }
+      }
+      const res = pearsonPair(xi, xj);
+      matrix[i][j] = res;
+      matrix[j][i] = res;
+    }
+  }
+
+  return { names, matrix };
+}
+
+// ---------- 5. OLS Linear Regression (SPSS Format) ----------
+
+export function runOLSWithDiagnostics(
+  id: string,
+  hypothesis: string,
+  label: string,
+  dependentName: string,
+  yRaw: (number | null)[],
+  xCols: { name: string; values: (number | null)[] }[],
+  controls: string[] = []
+): { result: RegressionResult | null; issue?: StepIssue } {
+  if (!xCols.length) {
+    return {
+      result: null,
+      issue: {
+        step: 'regression',
+        severity: 'warning',
+        message: `${hypothesis}(${label}): 독립변수가 선택되지 않아 회귀분석을 실행할 수 없습니다.`,
+        actionHint: '0단계 [변수 매핑 · 모형 설정]에서 독립변수를 지정해 주세요.',
+      },
+    };
+  }
+
+  const rows: { y: number; x: number[] }[] = [];
+  for (let i = 0; i < yRaw.length; i++) {
+    const yv = yRaw[i];
+    if (yv === null || !Number.isFinite(yv)) continue;
+    const row = [1];
+    let ok = true;
+    for (const col of xCols) {
+      const xv = col.values[i];
+      if (xv === null || !Number.isFinite(xv)) {
+        ok = false;
+        break;
+      }
+      row.push(xv);
+    }
+    if (ok) rows.push({ y: yv, x: row });
+  }
+
+  const n = rows.length;
+  const k = xCols.length;
+  const p = k + 1;
+  if (n <= p) {
+    return {
+      result: null,
+      issue: {
+        step: 'regression',
+        severity: 'error',
+        constraint: `표본 수(N=${n}) ≤ 모수 수(${p})`,
+        message: `${hypothesis}(${label}): 결측 제외 후 유효 표본 수(N=${n})가 추정 모수 수(독립·통제변수 ${k}개 + 상수 = ${p}) 이하이므로 회귀분석이 불가능합니다.`,
+        actionHint: `최소 ${p + 1}개 이상의 완전한 수치 응답 행이 필요하며, 결측이 많은 변수를 확인해 주세요.`,
+        variables: [dependentName, ...xCols.map((c) => c.name)],
+      },
+    };
+  }
+
+  // Check zero-variance columns before inversion
+  const ySample = rows.map((r) => r.y);
+  const ySdCheck = std(ySample, 1);
+  if (!Number.isFinite(ySdCheck) || ySdCheck <= 1e-12) {
+    return {
+      result: null,
+      issue: {
+        step: 'regression',
+        severity: 'error',
+        constraint: '종속변수 분산 0 (상수)',
+        message: `${hypothesis}(${label}): 종속변수 '${dependentName}'의 유효 표본 값이 모두 동일하여(분산 0) 회귀식을 추정할 수 없습니다.`,
+        variables: [dependentName],
+      },
+    };
+  }
+
+  const constPredictors: string[] = [];
+  for (let j = 0; j < k; j++) {
+    const colSd = std(rows.map((r) => r.x[j + 1]), 1);
+    if (!Number.isFinite(colSd) || colSd <= 1e-12) {
+      constPredictors.push(xCols[j].name);
+    }
+  }
+  if (constPredictors.length > 0) {
+    return {
+      result: null,
+      issue: {
+        step: 'regression',
+        severity: 'error',
+        constraint: '독립·통제변수 분산 0 (상수)',
+        message: `${hypothesis}(${label}): 투입 변수 [${constPredictors.join(', ')}]의 값이 모두 동일(분산 0)하여 회귀계수를 계산할 수 없습니다.`,
+        actionHint: '해당 변수의 데이터 값이나 통제/독립변수 구성을 확인해 주세요.',
+        variables: constPredictors,
+      },
+    };
+  }
+
+  // Build X'X and X'y
+  const XtX = Array.from({ length: p }, () => Array(p).fill(0));
+  const Xty = Array(p).fill(0);
+  for (const r of rows) {
+    for (let i = 0; i < p; i++) {
+      Xty[i] += r.x[i] * r.y;
+      for (let j = 0; j < p; j++) {
+        XtX[i][j] += r.x[i] * r.x[j];
+      }
+    }
+  }
+
+  const invRes = invertMatrix(XtX);
+  if (!invRes) {
+    return {
+      result: null,
+      issue: {
+        step: 'regression',
+        severity: 'error',
+        constraint: '완전 다중공선성 (역행렬 계산 실패)',
+        message: `${hypothesis}(${label}): 투입된 변수 간 완전 다중공선성(동일하거나 선형 종속인 변수)이 존재하여 역행렬 계산에 실패했습니다.`,
+        actionHint: '중복된 문항이나 동일한 변수(예: 합변수와 구성 문항 동시 투입)가 없는지 확인해 주세요.',
+        variables: xCols.map((c) => c.name),
+      },
+    };
+  }
+  const { inv } = invRes;
+
+  const b = Array(p).fill(0);
+  for (let i = 0; i < p; i++) {
+    for (let j = 0; j < p; j++) b[i] += inv[i][j] * Xty[j];
+  }
+
+  const yMean = rows.reduce((s, r) => s + r.y, 0) / n;
+  let ssRes = 0;
+  let ssTot = 0;
+  const residuals: number[] = [];
+  for (const r of rows) {
+    let yh = 0;
+    for (let i = 0; i < p; i++) yh += b[i] * r.x[i];
+    const res = r.y - yh;
+    residuals.push(res);
+    ssRes += res * res;
+    ssTot += (r.y - yMean) ** 2;
+  }
+
+  const ssReg = Math.max(0, ssTot - ssRes);
+  const dfReg = k;
+  const dfRes = n - k - 1;
+  const dfTot = n - 1;
+  const msReg = ssReg / dfReg;
+  const msRes = ssRes / dfRes;
+  const stdErrorEst = Math.sqrt(Math.max(0, msRes));
+
+  const r2 = ssTot > 0 ? Math.min(1, Math.max(0, 1 - ssRes / ssTot)) : 0;
+  const r = Math.sqrt(r2);
+  const adjR2 = 1 - ((1 - r2) * (n - 1)) / dfRes;
+  const f = msRes > 0 ? msReg / msRes : 0;
+  const modelP = fDistP(f, dfReg, dfRes);
+
+  // Durbin-Watson
+  let dwNum = 0;
+  for (let i = 1; i < residuals.length; i++) {
+    dwNum += (residuals[i] - residuals[i - 1]) ** 2;
+  }
+  const durbinWatson = ssRes > 0 ? dwNum / ssRes : NaN;
+
+  // Predictor SDs on the exact regression sample (for exact standardized beta & VIF)
+  const ySd = Math.sqrt(ssTot / (n - 1));
+  const xSampleCols = Array.from({ length: k }, (_, j) => rows.map((row) => row.x[j + 1]));
+
+  // Collinearity diagnostics (VIF & Tolerance)
+  const vifs: (number | null)[] = Array(k).fill(null);
+  if (k === 1) {
+    vifs[0] = 1;
+  } else {
+    // Standardize X predictors -> correlation matrix Rxx -> diagonal of Rxx^{-1} = VIF!
+    const Rxx = Array.from({ length: k }, () => Array(k).fill(0));
+    for (let i = 0; i < k; i++) {
+      Rxx[i][i] = 1;
+      for (let j = i + 1; j < k; j++) {
+        const { r: corr } = pearsonPair(xSampleCols[i], xSampleCols[j]);
+        Rxx[i][j] = Number.isFinite(corr) ? corr : 0;
+        Rxx[j][i] = Rxx[i][j];
+      }
+    }
+    const rxxInv = invertMatrix(Rxx);
+    if (rxxInv) {
+      for (let j = 0; j < k; j++) {
+        vifs[j] = rxxInv.inv[j][j];
+      }
+    }
+  }
+
+  const coeffs: RegressionCoeff[] = [];
+  for (let i = 0; i < p; i++) {
+    const se = Math.sqrt(Math.max(0, inv[i][i] * msRes));
+    const t = se > 0 ? b[i] / se : NaN;
+    const pval = tDistP(Math.abs(t), dfRes);
+    if (i === 0) {
+      coeffs.push({
+        name: '(상수)',
+        b: b[i],
+        se,
+        beta: null,
+        t,
+        p: pval,
+        tolerance: null,
+        vif: null,
+      });
+    } else {
+      const xSd = std(xSampleCols[i - 1], 1);
+      const beta = xSd && ySd ? (b[i] * xSd) / ySd : NaN;
+      const vifVal = vifs[i - 1];
+      const tolVal = vifVal && vifVal > 0 ? 1 / vifVal : null;
+      coeffs.push({
+        name: xCols[i - 1].name,
+        b: b[i],
+        se,
+        beta,
+        t,
+        p: pval,
+        tolerance: tolVal,
+        vif: vifVal,
+      });
+    }
+  }
+
+  const residualSummary: RegressionResidualSummary = (() => {
+    const min = residuals.length ? Math.min(...residuals) : 0;
+    const max = residuals.length ? Math.max(...residuals) : 0;
+    const resSd = residuals.length > 1 ? std(residuals, 1) : 0;
+    const stdRes = residuals.map((res) => (stdErrorEst > 0 ? res / stdErrorEst : 0));
+    const stdMin = stdRes.length ? Math.min(...stdRes) : 0;
+    const stdMax = stdRes.length ? Math.max(...stdRes) : 0;
+    const extremeCount = stdRes.filter((z) => Math.abs(z) > 3).length;
+    return {
+      min,
+      max,
+      sd: Number.isFinite(resSd) ? resSd : 0,
+      stdMin,
+      stdMax,
+      extremeCount,
+    };
+  })();
+
+  return {
+    result: {
+      id,
+      hypothesis,
+      label,
+      dependent: dependentName,
+      independents: xCols.map((c) => c.name).filter((n) => !controls.includes(n)),
+      controls,
+      n,
+      k,
+      r,
+      r2,
+      adjR2,
+      stdErrorEst,
+      durbinWatson,
+      residuals: residualSummary,
+      anova: {
+        ssReg,
+        dfReg,
+        msReg,
+        ssRes,
+        dfRes,
+        msRes,
+        ssTot,
+        dfTot,
+        f,
+        p: modelP,
+      },
+      coeffs,
+    },
+  };
+}
+
+export function runOLS(
+  id: string,
+  hypothesis: string,
+  label: string,
+  dependentName: string,
+  yRaw: (number | null)[],
+  xCols: { name: string; values: (number | null)[] }[],
+  controls: string[] = []
+): RegressionResult | null {
+  return runOLSWithDiagnostics(id, hypothesis, label, dependentName, yRaw, xCols, controls).result;
+}
+
+// ---------- 6. Mediation Analysis (Baron & Kenny + Sobel + Bootstrap 95% CI) ----------
+
+// Deterministic PRNG (Mulberry32) so bootstrap CI is reproducible across re-renders
+function mulberry32(seed: number) {
+  let a = seed;
+  return function () {
+    let t = (a += 0x6d2b79f5);
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+export function runMediation(
+  composites: CompositeSummary[],
+  hyp: HypothesisConfig,
+  h1Reg: RegressionResult | null,
+  h3Reg: RegressionResult | null,
+  bootstrapSamples = 1000,
+  controlCols: { name: string; values: (number | null)[] }[] = []
+): MediationAnalysisResult | null {
+  const medComp = composites.find((c) => c.name === hyp.mediator);
+  const depComp = composites.find((c) => c.name === hyp.dependent);
+  const indepComps = hyp.independents
+    .map((name) => composites.find((c) => c.name === name))
+    .filter((c): c is CompositeSummary => !!c && c.name !== hyp.mediator && c.name !== hyp.dependent);
+
+  if (!medComp || !depComp || !indepComps.length || medComp.name === depComp.name) {
+    return null;
+  }
+
+  const controlNames = controlCols.map((c) => c.name);
+
+  // Step 4 regression: Y <- Controls + X1..Xk + Mediator
+  const step4X = [
+    ...controlCols,
+    ...indepComps.map((c) => ({ name: c.name, values: c.values })),
+    { name: medComp.name, values: medComp.values },
+  ];
+  const step4Regression = runOLS(
+    'H4',
+    '매개검증 (4단계)',
+    `${depComp.name} ← ${indepComps.map((c) => c.name).join(' + ')} + ${medComp.name}`,
+    depComp.name,
+    depComp.values,
+    step4X,
+    controlNames
+  );
+
+  if (!step4Regression || !h1Reg || !h3Reg) return null;
+
+  // R2 change from H3 -> H4
+  const r2ChangeFromH3 = step4Regression.r2 - h3Reg.r2;
+  const dfNum = 1;
+  const dfDen = step4Regression.anova.dfRes;
+  const fChangeFromH3 =
+    dfDen > 0 && step4Regression.r2 < 1
+      ? (r2ChangeFromH3 / dfNum) / ((1 - step4Regression.r2) / dfDen)
+      : null;
+  const pChangeFromH3 = fChangeFromH3 !== null ? fDistP(fChangeFromH3, dfNum, dfDen) : null;
+
+  const medInH4 = step4Regression.coeffs.find((c) => c.name === medComp.name);
+  if (!medInH4) return null;
+
+  // Build aligned complete-case dataset for bootstrap
+  const completeRows: { x: number[]; ctrl: number[]; m: number; y: number }[] = [];
+  for (let i = 0; i < depComp.values.length; i++) {
+    const mv = medComp.values[i];
+    const yv = depComp.values[i];
+    if (mv === null || yv === null) continue;
+    const xRow: number[] = [];
+    const ctrlRow: number[] = [];
+    let ok = true;
+    for (const ic of indepComps) {
+      const xv = ic.values[i];
+      if (xv === null) {
+        ok = false;
+        break;
+      }
+      xRow.push(xv);
+    }
+    if (!ok) continue;
+    for (const cc of controlCols) {
+      const cv = cc.values[i];
+      if (cv === null) {
+        ok = false;
+        break;
+      }
+      ctrlRow.push(cv);
+    }
+    if (ok) completeRows.push({ x: xRow, ctrl: ctrlRow, m: mv, y: yv });
+  }
+
+  const paths: MediationPathResult[] = [];
+  const n = completeRows.length;
+  const rand = mulberry32(20261121);
+
+  // Pre-generate bootstrap indirect effect matrix [boot][indepIdx]
+  const bootIndirects: number[][] = Array.from({ length: indepComps.length }, () => []);
+
+  if (n > indepComps.length + controlCols.length + 4) {
+    for (let bIdx = 0; bIdx < bootstrapSamples; bIdx++) {
+      const sampleX = Array.from({ length: indepComps.length }, () => [] as (number | null)[]);
+      const sampleCtrl = Array.from({ length: controlCols.length }, () => [] as (number | null)[]);
+      const sampleM: (number | null)[] = [];
+      const sampleY: (number | null)[] = [];
+      for (let i = 0; i < n; i++) {
+        const pick = Math.floor(rand() * n);
+        const row = completeRows[pick];
+        sampleM.push(row.m);
+        sampleY.push(row.y);
+        for (let j = 0; j < indepComps.length; j++) {
+          sampleX[j].push(row.x[j]);
+        }
+        for (let cIdx = 0; cIdx < controlCols.length; cIdx++) {
+          sampleCtrl[cIdx].push(row.ctrl[cIdx]);
+        }
+      }
+
+      const bCtrlCols = controlCols.map((c, cIdx) => ({ name: c.name, values: sampleCtrl[cIdx] }));
+      const bH1 = runOLS(
+        'b1',
+        '',
+        '',
+        'M',
+        sampleM,
+        [...bCtrlCols, ...indepComps.map((c, j) => ({ name: c.name, values: sampleX[j] }))],
+        controlNames
+      );
+      const bH4 = runOLS(
+        'b4',
+        '',
+        '',
+        'Y',
+        sampleY,
+        [
+          ...bCtrlCols,
+          ...indepComps.map((c, j) => ({ name: c.name, values: sampleX[j] })),
+          { name: medComp.name, values: sampleM },
+        ],
+        controlNames
+      );
+
+      if (bH1 && bH4) {
+        const bCoeff = bH4.coeffs.find((c) => c.name === medComp.name)?.b ?? NaN;
+        for (let j = 0; j < indepComps.length; j++) {
+          const aCoeff = bH1.coeffs.find((c) => c.name === indepComps[j].name)?.b ?? NaN;
+          if (Number.isFinite(aCoeff) && Number.isFinite(bCoeff)) {
+            bootIndirects[j].push(aCoeff * bCoeff);
+          }
+        }
+      }
+    }
+  }
+
+  for (let j = 0; j < indepComps.length; j++) {
+    const xName = indepComps[j].name;
+    const xInH1 = h1Reg.coeffs.find((c) => c.name === xName);
+    const xInH3 = h3Reg.coeffs.find((c) => c.name === xName);
+    const xInH4 = step4Regression.coeffs.find((c) => c.name === xName);
+
+    const a = xInH1?.b ?? NaN;
+    const seA = xInH1?.se ?? NaN;
+    const pA = xInH1?.p ?? NaN;
+    const b = medInH4.b;
+    const seB = medInH4.se;
+    const pB = medInH4.p;
+    const cTotal = xInH3?.b ?? NaN;
+    const pCTotal = xInH3?.p ?? NaN;
+    const cPrime = xInH4?.b ?? NaN;
+    const pCPrime = xInH4?.p ?? NaN;
+
+    const indirectEffect = a * b;
+    const sobelSE = Math.sqrt(Math.max(0, b * b * seA * seA + a * a * seB * seB));
+    const sobelZ = sobelSE > 0 ? indirectEffect / sobelSE : NaN;
+    const sobelP = normalP(sobelZ);
+
+    const dist = [...bootIndirects[j]].sort((u, v) => u - v);
+    const bootMean = dist.length ? mean(dist) : NaN;
+    const bootSE = dist.length > 1 ? std(dist, 1) : NaN;
+    const bootCiLow = dist.length ? dist[Math.floor(0.025 * dist.length)] : NaN;
+    const bootCiHigh = dist.length
+      ? dist[Math.min(dist.length - 1, Math.floor(0.975 * dist.length))]
+      : NaN;
+
+    const ciExcludesZero =
+      Number.isFinite(bootCiLow) && Number.isFinite(bootCiHigh) && (bootCiLow > 0 || bootCiHigh < 0);
+    const indirectSig = pA < 0.05 && pB < 0.05 && (sobelP < 0.05 || ciExcludesZero);
+
+    let status: MediationPathResult['status'] = 'none';
+    if (indirectSig) {
+      if (pCTotal < 0.05 && pCPrime >= 0.05) {
+        status = 'full';
+      } else if (pCTotal < 0.05 && pCPrime < 0.05) {
+        status = 'partial';
+      } else if (pCTotal >= 0.05) {
+        status = 'indirect_only';
+      }
+    }
+
+    paths.push({
+      independent: xName,
+      mediator: medComp.name,
+      dependent: depComp.name,
+      a,
+      seA,
+      pA,
+      b,
+      seB,
+      pB,
+      cTotal,
+      pCTotal,
+      cPrime,
+      pCPrime,
+      indirectEffect,
+      sobelZ,
+      sobelSE,
+      sobelP,
+      bootMean,
+      bootSE,
+      bootCiLow,
+      bootCiHigh,
+      status,
+    });
+  }
+
+  return {
+    step4Regression,
+    r2ChangeFromH3,
+    fChangeFromH3,
+    pChangeFromH3,
+    paths,
+    bootstrapSamples,
+  };
+}
+
+// ---------- 7. Hierarchical Moderation Analysis (Mean-Centered + Simple Slopes) ----------
+
+export function runModeration(
+  xName: string,
+  xValues: (number | null)[],
+  wName: string,
+  wValues: (number | null)[],
+  yName: string,
+  yValues: (number | null)[],
+  controlCols: { name: string; values: (number | null)[] }[] = []
+): ModerationResult | null {
+  if (xName === wName || xName === yName || wName === yName) return null;
+
+  // Complete-case alignment
+  const validIndices: number[] = [];
+  for (let i = 0; i < yValues.length; i++) {
+    const xv = xValues[i];
+    const wv = wValues[i];
+    const yv = yValues[i];
+    if (xv === null || wv === null || yv === null) continue;
+    let ok = true;
+    for (const cc of controlCols) {
+      if (cc.values[i] === null) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) validIndices.push(i);
+  }
+
+  const n = validIndices.length;
+  const kTotal = controlCols.length + 3;
+  if (n <= kTotal + 2) return null;
+
+  const validX = validIndices.map((idx) => xValues[idx] as number);
+  const validW = validIndices.map((idx) => wValues[idx] as number);
+  const xMean = mean(validX);
+  const wMean = mean(validW);
+  const wSd = std(validW, 1);
+
+  const xCentered: (number | null)[] = xValues.map((v) => (v !== null ? v - xMean : null));
+  const wCentered: (number | null)[] = wValues.map((v) => (v !== null ? v - wMean : null));
+  const interactionVals: (number | null)[] = xCentered.map((xc, idx) => {
+    const wc = wCentered[idx];
+    return xc !== null && wc !== null ? xc * wc : null;
+  });
+
+  const interName = `${xName}×${wName}`;
+  const ctrlNames = controlCols.map((c) => c.name);
+
+  const step1 = runOLS(
+    'MOD1',
+    '조절 1단계',
+    `${yName} ← ${xName} + ${wName}`,
+    yName,
+    yValues,
+    [...controlCols, { name: xName, values: xCentered }, { name: wName, values: wCentered }],
+    ctrlNames
+  );
+  const step2 = runOLS(
+    'MOD2',
+    '조절 2단계 (상호작용)',
+    `${yName} ← ${xName} + ${wName} + ${interName}`,
+    yName,
+    yValues,
+    [
+      ...controlCols,
+      { name: xName, values: xCentered },
+      { name: wName, values: wCentered },
+      { name: interName, values: interactionVals },
+    ],
+    ctrlNames
+  );
+
+  if (!step1 || !step2) return null;
+  const interCoeff = step2.coeffs.find((c) => c.name === interName);
+  if (!interCoeff) return null;
+
+  const r2Change = Math.max(0, step2.r2 - step1.r2);
+  const dfRes = step2.anova.dfRes;
+  const fChange =
+    dfRes > 0 && step2.r2 < 1 ? r2Change / ((1 - step2.r2) / dfRes) : 0;
+  const pChange = fDistP(fChange, 1, dfRes);
+
+  // Compute exact covariance matrix (X'X)^-1 * msRes for simple slope SEs
+  const p = kTotal + 1; // intercept + controls + X + W + X*W
+  const XtX = Array.from({ length: p }, () => Array(p).fill(0));
+  for (const idx of validIndices) {
+    const rowVec = [
+      1,
+      ...controlCols.map((c) => c.values[idx] as number),
+      xCentered[idx] as number,
+      wCentered[idx] as number,
+      interactionVals[idx] as number,
+    ];
+    for (let r = 0; r < p; r++) {
+      for (let c = 0; c < p; c++) {
+        XtX[r][c] += rowVec[r] * rowVec[c];
+      }
+    }
+  }
+
+  const invRes = invertMatrix(XtX);
+  const xIdx = 1 + controlCols.length;
+  const interIdx = 3 + controlCols.length;
+  const b1 = step2.coeffs.find((c) => c.name === xName)?.b ?? 0;
+  const b3 = interCoeff.b;
+  const msRes = step2.anova.msRes;
+
+  const levels: { label: SimpleSlopePoint['level']; wCenteredVal: number; wActualVal: number }[] = [
+    { label: '저집단 (-1 SD)', wCenteredVal: -wSd, wActualVal: wMean - wSd },
+    { label: '평균 (Mean)', wCenteredVal: 0, wActualVal: wMean },
+    { label: '고집단 (+1 SD)', wCenteredVal: wSd, wActualVal: wMean + wSd },
+  ];
+
+  const simpleSlopes: SimpleSlopePoint[] = levels.map((lv) => {
+    const slope = b1 + b3 * lv.wCenteredVal;
+    let se = NaN;
+    if (invRes) {
+      const varB1 = invRes.inv[xIdx][xIdx] * msRes;
+      const varB3 = invRes.inv[interIdx][interIdx] * msRes;
+      const covB1B3 = invRes.inv[xIdx][interIdx] * msRes;
+      const varSlope = varB1 + lv.wCenteredVal * lv.wCenteredVal * varB3 + 2 * lv.wCenteredVal * covB1B3;
+      se = Math.sqrt(Math.max(0, varSlope));
+    }
+    const t = se > 0 ? slope / se : NaN;
+    const pVal = tDistP(Math.abs(t), dfRes);
+    return {
+      level: lv.label,
+      wValue: lv.wActualVal,
+      slope,
+      se,
+      t,
+      p: pVal,
+    };
+  });
+
+  return {
+    xName,
+    wName,
+    yName,
+    n,
+    step1,
+    step2,
+    r2Change,
+    fChange,
+    pChange,
+    interactionCoeff: interCoeff,
+    significant: interCoeff.p < 0.05,
+    simpleSlopes,
+  };
+}
+
+// ---------- Hypothesis Verdict & Formatting Helpers ----------
+
+export function getHypothesisVerdict(reg: RegressionResult): '채택' | '부분 채택' | '기각' {
+  if (reg.anova.p >= 0.05) return '기각';
+  const ctrlSet = new Set(reg.controls ?? []);
+  const focalPredictors = reg.coeffs.filter((c) => c.name !== '(상수)' && !ctrlSet.has(c.name));
+  if (!focalPredictors.length) return '기각';
+  const sigCount = focalPredictors.filter((c) => c.p < 0.05).length;
+  if (sigCount === focalPredictors.length) return '채택';
+  if (sigCount > 0) return '부분 채택';
+  return '기각';
+}
+
+export function evaluateHypotheses(
+  hypothesis: HypothesisConfig,
+  regressions: RegressionResult[],
+  mediation: MediationAnalysisResult | null,
+  moderation: ModerationResult | null,
+  constructNames: string[] = []
+): HypothesisVerificationRow[] {
+  const paths =
+    hypothesis.paths && hypothesis.paths.length > 0
+      ? hypothesis.paths
+      : buildDefaultPaths(hypothesis);
+  const nameSet = new Set(
+    constructNames.length
+      ? constructNames
+      : [
+          ...hypothesis.independents,
+          hypothesis.mediator,
+          hypothesis.dependent,
+          ...(hypothesis.moderator ? [hypothesis.moderator] : []),
+        ].filter(Boolean)
+  );
+
+  return paths.map((path) => {
+    const roleLabel =
+      path.role === 'mediation_a'
+        ? '매개 경로 (a)'
+        : path.role === 'mediation_b'
+          ? '매개 경로 (b)'
+          : path.role === 'moderation'
+            ? '조절 경로'
+            : '직접 경로';
+
+    if (path.role === 'moderation') {
+      if (!moderation) {
+        return {
+          hypothesisId: path.id,
+          pathLabel: `${path.from}${path.moderator ? ` × ${path.moderator}` : ''} → ${path.to}`,
+          role: roleLabel,
+          dependent: path.to,
+          predictors: [path.from, ...(path.moderator ? [path.moderator] : [])],
+          r2: null,
+          adjR2: null,
+          f: null,
+          p: null,
+          verdict: '미검증',
+          rationale: '조절변수/상호작용항 회귀모형이 아직 산출되지 않았습니다.',
+        };
+      }
+      const verdict: HypothesisVerificationRow['verdict'] = moderation.significant ? '채택' : '기각';
+      return {
+        hypothesisId: path.id,
+        pathLabel: `${moderation.xName} × ${moderation.wName} → ${moderation.yName}`,
+        role: roleLabel,
+        dependent: moderation.yName,
+        predictors: [moderation.xName, moderation.wName, `${moderation.xName}×${moderation.wName}`],
+        r2: moderation.step2.r2,
+        adjR2: moderation.step2.adjR2,
+        f: moderation.fChange,
+        p: moderation.interactionCoeff.p,
+        verdict,
+        rationale: moderation.significant
+          ? `상호작용항 B=${fmtNum(moderation.interactionCoeff.b, 3)} (${fmtP(moderation.interactionCoeff.p)}), ΔR²=${fmtNum(moderation.r2Change, 3)}`
+          : `상호작용항 ${fmtP(moderation.interactionCoeff.p)}로 유의수준 .05 미충족`,
+      };
+    }
+
+    const sources = parsePathSources(path.from, nameSet);
+    const sigTarget = `${path.to}<-${[...sources].sort().join('+')}`;
+    const matchedReg =
+      regressions.find((r) => r.id === path.id) ??
+      regressions.find(
+        (r) => `${r.dependent}<-${[...r.independents].sort().join('+')}` === sigTarget
+      );
+
+    if (!matchedReg) {
+      return {
+        hypothesisId: path.id,
+        pathLabel: `${path.from} → ${path.to}`,
+        role: roleLabel,
+        dependent: path.to,
+        predictors: sources,
+        r2: null,
+        adjR2: null,
+        f: null,
+        p: null,
+        verdict: '미검증',
+        rationale: '해당 가설 경로의 측정문항 연결/확정이 완료되지 않았거나 유효 표본이 부족합니다.',
+      };
+    }
+
+    const verdict = getHypothesisVerdict(matchedReg);
+    const ctrlSet = new Set(matchedReg.controls ?? []);
+    const focal = matchedReg.coeffs.filter((c) => c.name !== '(상수)' && !ctrlSet.has(c.name));
+    const sigNames = focal.filter((c) => c.p < 0.05).map((c) => `${c.name}(β=${fmtNum(c.beta, 3)})`);
+    let medNote = '';
+    if (path.role === 'direct' && mediation && mediation.paths.length > 0) {
+      const sigMeds = mediation.paths.filter((mp) => mp.status !== 'none');
+      if (sigMeds.length > 0) {
+        medNote = ` · 매개 ${sigMeds.map((mp) => `${mp.independent}(${mp.status === 'full' ? '완전' : mp.status === 'partial' ? '부분' : '간접'})`).join(', ')}`;
+      }
+    }
+
+    return {
+      hypothesisId: path.id,
+      pathLabel: matchedReg.label,
+      role: roleLabel,
+      dependent: matchedReg.dependent,
+      predictors: matchedReg.independents,
+      r2: matchedReg.r2,
+      adjR2: matchedReg.adjR2,
+      f: matchedReg.anova.f,
+      p: matchedReg.anova.p,
+      verdict,
+      rationale:
+        matchedReg.anova.p >= 0.05
+          ? `모형 F=${fmtNum(matchedReg.anova.f, 2)} (${fmtP(matchedReg.anova.p)}) 비유의`
+          : sigNames.length
+            ? `유의: ${sigNames.join(', ')}${medNote}`
+            : `모형 유의하나 개별 예측변수 비유의${medNote}`,
+    };
+  });
+}
+
+export function buildAnalysisAccuracyAudit(params: {
+  datasetId: string;
+  fileName: string;
+  rawRowCount: number;
+  columns: string[];
+  constructs: ConstructMapping[];
+  hypothesis: HypothesisConfig;
+  analysisOptions: AnalysisOptions;
+  bundle: AnalysisBundle;
+}): AnalysisExecutionMeta {
+  const { datasetId, fileName, rawRowCount, columns, constructs, hypothesis, analysisOptions, bundle } =
+    params;
+
+  const colSet = new Set(columns);
+  const mappedConstructs = constructs.filter(
+    (c) =>
+      c.confirmed !== false &&
+      c.items.length > 0 &&
+      c.items.every((it) => colSet.has(it))
+  );
+  const mappedItemCount = new Set(mappedConstructs.flatMap((c) => c.items)).size;
+  const reverseCodedCount = new Set(
+    mappedConstructs.flatMap((c) => c.reverseItems ?? [])
+  ).size;
+
+  const sampleNs: number[] = [];
+  if (bundle.efa?.n) sampleNs.push(bundle.efa.n);
+  bundle.reliability.forEach((r) => {
+    if (r.nValid > 0) sampleNs.push(r.nValid);
+  });
+  bundle.composites.forEach((c) => {
+    if (c.n > 0) sampleNs.push(c.n);
+  });
+  bundle.regressions.forEach((r) => {
+    if (r.n > 0) sampleNs.push(r.n);
+  });
+
+  const analyzedMaxN = sampleNs.length ? Math.max(...sampleNs) : 0;
+  const analyzedMinN = sampleNs.length ? Math.min(...sampleNs) : 0;
+
+  const allVifs: number[] = [];
+  bundle.regressions.forEach((reg) => {
+    reg.coeffs.forEach((c) => {
+      if (c.vif !== null && Number.isFinite(c.vif)) allVifs.push(c.vif);
+    });
+  });
+  const maxVif = allVifs.length ? Math.max(...allVifs) : null;
+
+  const missingUnconfirmed = constructs.filter(
+    (c) => c.items.length === 0 || c.confirmed === false || c.items.some((it) => !colSet.has(it))
+  );
+
+  const check1: AnalysisAccuracyCheck = {
+    key: 'dataset_binding',
+    label: '데이터셋 ID · 표본 수(N) 일치',
+    passed: analyzedMaxN > 0 && analyzedMaxN <= rawRowCount,
+    detail: `원본 ${rawRowCount}행 기준 분석 유효 N=${analyzedMinN}~${analyzedMaxN} (${datasetId})`,
+  };
+
+  const check2: AnalysisAccuracyCheck = {
+    key: 'construct_linkage',
+    label: '등록 구성개념 ↔ 실제 컬럼 매핑·확정',
+    passed: constructs.length > 0 && missingUnconfirmed.length === 0,
+    detail:
+      missingUnconfirmed.length === 0
+        ? `전체 ${constructs.length}개 구성개념(${mappedItemCount}개 문항) 연결·확정 완료`
+        : `미완료 구성개념 ${missingUnconfirmed.length}개: ${missingUnconfirmed.map((c) => c.name).join(', ')}`,
+  };
+
+  const compositeNames = new Set(bundle.composites.filter((c) => c.n > 0).map((c) => c.name));
+  const expectedComposites = mappedConstructs.map((c) => c.name);
+  const missingComposites = expectedComposites.filter((n) => !compositeNames.has(n));
+  const check3: AnalysisAccuracyCheck = {
+    key: 'composite_sync',
+    label: '합변수 · 상관 · 회귀 파이프라인 동기화',
+    passed: expectedComposites.length > 0 && missingComposites.length === 0,
+    detail:
+      missingComposites.length === 0
+        ? `합변수 ${bundle.composites.length}개(${analysisOptions.compositeMethod === 'sum' ? '합계' : '평균'}) · 회귀 모형 ${bundle.regressions.length}개 산출`
+        : `합변수 누락: ${missingComposites.join(', ')}`,
+  };
+
+  const check4: AnalysisAccuracyCheck = {
+    key: 'multicollinearity',
+    label: '회귀 공선성(VIF) 및 수치 안정성',
+    passed: maxVif === null || maxVif < 10,
+    detail:
+      maxVif !== null
+        ? `최대 VIF = ${fmtNum(maxVif, 3)} ${maxVif < 10 ? '(< 10 기준 충족)' : '(≥ 10 다중공선성 주의)'}`
+        : '단일 예측변수 또는 회귀모형 미실행',
+  };
+
+  const hypPathsCount = hypothesis.paths?.length ?? 0;
+  const verCount = bundle.hypothesisVerifications?.length ?? 0;
+  const check5: AnalysisAccuracyCheck = {
+    key: 'hypothesis_coverage',
+    label: '가설 경로 전체 검증 일치',
+    passed: hypPathsCount === 0 || verCount === hypPathsCount,
+    detail:
+      hypPathsCount === 0
+        ? '설정된 가설 경로 없음'
+        : `등록 가설 ${hypPathsCount}건 중 ${verCount}건 검증 표에 반영`,
+  };
+
+  const accuracyChecks = [check1, check2, check3, check4, check5];
+  return {
+    datasetId,
+    fileName,
+    executedAt: Date.now(),
+    rawRowCount,
+    analyzedMaxN,
+    analyzedMinN,
+    columnCount: columns.length,
+    registeredConstructCount: constructs.length,
+    mappedConstructCount: mappedConstructs.length,
+    mappedItemCount,
+    missingPolicy: analysisOptions.missingPolicy,
+    compositeMethod: analysisOptions.compositeMethod,
+    reverseCodedCount,
+    accuracyChecks,
+    allChecksPassed: accuracyChecks.every((ch) => ch.passed),
+  };
+}
+
+export function fmtNum(v: number | null | undefined, digits = 3): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return '—';
+  return v.toFixed(digits);
+}
+
+export function fmtP(p: number | null | undefined): string {
+  if (p === null || p === undefined || !Number.isFinite(p)) return '—';
+  if (p < 0.001) return '< .001';
+  return p.toFixed(3);
+}
+
+export function sigStars(p: number | null | undefined): string {
+  if (p === null || p === undefined || !Number.isFinite(p)) return '';
+  if (p < 0.001) return '***';
+  if (p < 0.01) return '**';
+  if (p < 0.05) return '*';
+  return '';
+}
